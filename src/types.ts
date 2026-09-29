@@ -73,6 +73,31 @@ export interface StudioState {
   updatedAt: string
 }
 
+export interface CueFieldChange {
+  label: string
+  before: string
+  after: string
+}
+
+export interface CueDiff {
+  cueId: string
+  state: 'added' | 'removed' | 'modified'
+  title: string
+  detail: string
+  changes: CueFieldChange[]
+}
+
+export interface SceneDiff {
+  sceneId: string
+  code: string
+  title: string
+  sceneState: 'added' | 'removed' | 'kept'
+  addedCount: number
+  removedCount: number
+  modifiedCount: number
+  cues: CueDiff[]
+}
+
 export interface WarningItem {
   id: string
   type: 'collision' | 'missing-sfx' | 'over-time'

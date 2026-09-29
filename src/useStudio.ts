@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 import { sampleDocument } from './sample'
-import type { Cue, CueKind, FrozenVersion, PendingChange, Scene, StudioDocument, StudioState, WarningItem } from './types'
+import type { Cue, CueDiff, CueFieldChange, CueKind, FrozenVersion, PendingChange, Scene, SceneDiff, StudioDocument, StudioState, WarningItem } from './types'
 
 const STORAGE_KEY = 'sologsb-1016-studio-v1'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -28,6 +28,7 @@ export function useStudio() {
   const state = ref<StudioState>(loadState())
   const selectedSceneId = ref(state.value.document.scenes[0]?.id ?? '')
   const selectedCueId = ref('')
+  const selectedVersionId = ref('')
   const saveState = ref<'saved' | 'saving' | 'dirty'>('saved')
   const undoStack = ref<StudioDocument[]>([])
   const redoStack = ref<StudioDocument[]>([])
@@ -311,6 +312,141 @@ export function useStudio() {
     return version
   }
 
+  const kindLabels: Record<CueKind, string> = { dialogue: '台词', sfx: '音效', transition: '转场' }
+
+  function describeCue(document: StudioDocument, cue: Cue) {
+    if (cue.kind === 'dialogue') {
+      const name = document.characters.find((character) => character.id === cue.characterId)?.name ?? '未指定角色'
+      return { title: `台词｜${name}`, detail: `${cue.text}（${cue.emotion || '自然'} · 语速 ${cue.rate}×）` }
+    }
+    if (cue.kind === 'sfx') {
+      const effect = document.soundEffects.find((item) => item.id === cue.soundEffectId)
+      return { title: `音效｜${effect?.name ?? '缺失引用'}`, detail: cue.text }
+    }
+    return { title: `转场｜${cue.transition || '未设置'}`, detail: cue.text }
+  }
+
+  function formatCueField(document: StudioDocument, cue: Cue, field: keyof Cue): string {
+    switch (field) {
+      case 'kind':
+        return kindLabels[cue.kind]
+      case 'characterId':
+        return document.characters.find((character) => character.id === cue.characterId)?.name ?? '未指定角色'
+      case 'soundEffectId':
+        return cue.soundEffectId ? document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失引用' : '未选择音效'
+      case 'rate':
+        return `${cue.rate}×`
+      case 'manualDuration':
+        return cue.manualDuration === undefined ? '自动' : `${cue.manualDuration} 秒`
+      default: {
+        const value = cue[field]
+        return value === undefined || value === '' ? '（空）' : String(value)
+      }
+    }
+  }
+
+  const cueDiffFields: Array<{ field: keyof Cue; label: string }> = [
+    { field: 'kind', label: '类型' },
+    { field: 'characterId', label: '角色' },
+    { field: 'text', label: '文本' },
+    { field: 'emotion', label: '情绪' },
+    { field: 'rate', label: '语速' },
+    { field: 'soundEffectId', label: '音效素材' },
+    { field: 'transition', label: '转场方式' },
+    { field: 'manualDuration', label: '手动时长' }
+  ]
+
+  function diffCue(beforeDocument: StudioDocument, before: Cue, afterDocument: StudioDocument, after: Cue): CueFieldChange[] {
+    const changes: CueFieldChange[] = []
+    for (const { field, label } of cueDiffFields) {
+      const oldValue = before[field] ?? ''
+      const newValue = after[field] ?? ''
+      if (oldValue !== newValue) {
+        changes.push({ label, before: formatCueField(beforeDocument, before, field), after: formatCueField(afterDocument, after, field) })
+      }
+    }
+    return changes
+  }
+
+  function diffVersion(version: FrozenVersion): SceneDiff[] {
+    const beforeDocument = version.document
+    const afterDocument = state.value.document
+    const diffs: SceneDiff[] = []
+    const beforeSceneMap = new Map(beforeDocument.scenes.map((scene) => [scene.id, scene]))
+
+    for (const afterScene of afterDocument.scenes) {
+      const beforeScene = beforeSceneMap.get(afterScene.id)
+      if (!beforeScene) {
+        diffs.push({
+          sceneId: afterScene.id,
+          code: afterScene.code,
+          title: afterScene.title,
+          sceneState: 'added',
+          addedCount: afterScene.cues.length,
+          removedCount: 0,
+          modifiedCount: 0,
+          cues: afterScene.cues.map((cue): CueDiff => ({ cueId: cue.id, state: 'added', ...describeCue(afterDocument, cue), changes: [] }))
+        })
+        continue
+      }
+      const beforeCueMap = new Map(beforeScene.cues.map((cue) => [cue.id, cue]))
+      const afterCueIds = new Set(afterScene.cues.map((cue) => cue.id))
+      const cues: CueDiff[] = []
+      for (const cue of afterScene.cues) {
+        const before = beforeCueMap.get(cue.id)
+        if (!before) {
+          cues.push({ cueId: cue.id, state: 'added', ...describeCue(afterDocument, cue), changes: [] })
+        } else {
+          const changes = diffCue(beforeDocument, before, afterDocument, cue)
+          if (changes.length) cues.push({ cueId: cue.id, state: 'modified', ...describeCue(afterDocument, cue), changes })
+        }
+      }
+      for (const cue of beforeScene.cues) {
+        if (!afterCueIds.has(cue.id)) cues.push({ cueId: cue.id, state: 'removed', ...describeCue(beforeDocument, cue), changes: [] })
+      }
+      if (cues.length) {
+        diffs.push({
+          sceneId: afterScene.id,
+          code: afterScene.code,
+          title: afterScene.title,
+          sceneState: 'kept',
+          addedCount: cues.filter((cue) => cue.state === 'added').length,
+          removedCount: cues.filter((cue) => cue.state === 'removed').length,
+          modifiedCount: cues.filter((cue) => cue.state === 'modified').length,
+          cues
+        })
+      }
+    }
+
+    const afterSceneIds = new Set(afterDocument.scenes.map((scene) => scene.id))
+    for (const beforeScene of beforeDocument.scenes) {
+      if (afterSceneIds.has(beforeScene.id)) continue
+      diffs.push({
+        sceneId: beforeScene.id,
+        code: beforeScene.code,
+        title: beforeScene.title,
+        sceneState: 'removed',
+        addedCount: 0,
+        removedCount: beforeScene.cues.length,
+        modifiedCount: 0,
+        cues: beforeScene.cues.map((cue): CueDiff => ({ cueId: cue.id, state: 'removed', ...describeCue(beforeDocument, cue), changes: [] }))
+      })
+    }
+    return diffs
+  }
+
+  function restoreVersion(version: FrozenVersion) {
+    const lost = state.value.pending.filter((item) => item.status === 'pending').length
+    for (const change of state.value.pending) {
+      if (change.status === 'pending') change.status = 'rejected'
+    }
+    commit(`恢复版本「${version.name}」`, (document) => {
+      Object.assign(document, clone(version.document))
+    }, lost ? `同时退回 ${lost} 条未确认修改；撤销可回到恢复前的草稿。` : '撤销可回到恢复前的草稿。')
+    selectedSceneId.value = state.value.document.scenes[0]?.id ?? ''
+    selectedCueId.value = ''
+  }
+
   function makeScript(document: StudioDocument): string {
     const lines = [
       document.title,
@@ -368,6 +504,7 @@ export function useStudio() {
     state,
     selectedSceneId,
     selectedCueId,
+    selectedVersionId,
     selectedScene,
     totalDuration,
     pendingChanges,
@@ -390,6 +527,8 @@ export function useStudio() {
     undo,
     redo,
     freeze,
+    diffVersion,
+    restoreVersion,
     downloadVersion,
     makeScript,
     resetSample,

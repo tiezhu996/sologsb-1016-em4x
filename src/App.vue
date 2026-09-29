@@ -23,6 +23,7 @@ const studio = useStudio()
 const {
   state,
   selectedSceneId,
+  selectedVersionId,
   selectedScene,
   totalDuration,
   pendingChanges,
@@ -45,6 +46,8 @@ const {
   undo,
   redo,
   freeze,
+  diffVersion,
+  restoreVersion,
   downloadVersion,
   resetSample
 } = studio
@@ -53,6 +56,9 @@ const dragCueId = ref('')
 const showFreezeModal = ref(false)
 const freezeName = ref('')
 const activeRightTab = ref('warnings')
+const showDiffModal = ref(false)
+const showRestoreModal = ref(false)
+const expandedDiffScenes = ref<Set<string>>(new Set())
 
 const kindOptions = [
   { label: '台词', value: 'dialogue' },
@@ -128,6 +134,42 @@ function confirmFreeze() {
   const version = freeze(freezeName.value)
   showFreezeModal.value = false
   downloadVersion(version)
+}
+
+const selectedVersion = computed(() => state.value.frozen.find((version) => version.id === selectedVersionId.value))
+const versionDiff = computed(() => (selectedVersion.value ? diffVersion(selectedVersion.value) : []))
+const diffTotals = computed(() => versionDiff.value.reduce(
+  (totals, scene) => ({ added: totals.added + scene.addedCount, removed: totals.removed + scene.removedCount, modified: totals.modified + scene.modifiedCount }),
+  { added: 0, removed: 0, modified: 0 }
+))
+
+function toggleVersion(versionId: string) {
+  selectedVersionId.value = selectedVersionId.value === versionId ? '' : versionId
+}
+
+function toggleDiffScene(sceneId: string) {
+  const next = new Set(expandedDiffScenes.value)
+  if (next.has(sceneId)) next.delete(sceneId)
+  else next.add(sceneId)
+  expandedDiffScenes.value = next
+}
+
+function openDiff() {
+  if (!selectedVersion.value) return
+  expandedDiffScenes.value = new Set(versionDiff.value.slice(0, 1).map((scene) => scene.sceneId))
+  showDiffModal.value = true
+}
+
+function openRestore() {
+  if (!selectedVersion.value) return
+  showRestoreModal.value = true
+}
+
+function confirmRestore() {
+  if (!selectedVersion.value) return
+  restoreVersion(selectedVersion.value)
+  showRestoreModal.value = false
+  showDiffModal.value = false
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -383,14 +425,34 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             </n-tab-pane>
 
             <n-tab-pane name="versions" :tab="`冻结 ${state.frozen.length}`">
+              <div class="pending-toolbar">
+                <n-alert type="info" :show-icon="false">冻结版本为只读快照。点击卡片选中版本后，可对比当前草稿或恢复该版本。</n-alert>
+              </div>
+              <div v-if="selectedVersion" class="version-actions">
+                <div class="version-actions-info">
+                  <strong>已选中「{{ selectedVersion.name }}」</strong>
+                  <span>旧版只读</span>
+                </div>
+                <div class="version-actions-buttons">
+                  <n-button size="small" type="primary" secondary @click="openDiff">对比当前草稿</n-button>
+                  <n-button size="small" type="warning" tertiary @click="openRestore">恢复此版本</n-button>
+                  <n-button size="small" quaternary @click="selectedVersionId = ''">取消选中</n-button>
+                </div>
+              </div>
               <div class="review-list">
-                <div v-for="version in state.frozen" :key="version.id" class="version-card">
+                <div
+                  v-for="version in state.frozen"
+                  :key="version.id"
+                  class="version-card"
+                  :class="{ active: version.id === selectedVersionId }"
+                  @click="toggleVersion(version.id)"
+                >
                   <div>
                     <strong>{{ version.name }}</strong>
                     <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
                     <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
                   </div>
-                  <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
+                  <n-button size="small" type="primary" secondary @click.stop="downloadVersion(version)">导出稿</n-button>
                 </div>
                 <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
               </div>
@@ -409,6 +471,78 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         <div class="dialog-actions">
           <n-button @click="showFreezeModal = false">取消</n-button>
           <n-button type="primary" @click="confirmFreeze">冻结并导出</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showDiffModal">
+      <div class="dialog-card diff-dialog">
+        <span class="eyebrow">VERSION DIFF</span>
+        <h2>对比「{{ selectedVersion?.name }}」与当前草稿</h2>
+        <p v-if="versionDiff.length" class="diff-summary">
+          {{ versionDiff.length }} 场有差异 · 新增 {{ diffTotals.added }} 项 · 删除 {{ diffTotals.removed }} 项 · 改动 {{ diffTotals.modified }} 项（旧版 → 当前草稿）
+        </p>
+        <div v-if="versionDiff.length" class="diff-list">
+          <section v-for="scene in versionDiff" :key="scene.sceneId" class="diff-scene">
+            <button class="diff-scene-head" @click="toggleDiffScene(scene.sceneId)">
+              <span class="diff-scene-name">
+                <strong>{{ scene.code }} · {{ scene.title }}</strong>
+                <n-tag v-if="scene.sceneState !== 'kept'" size="small" :type="scene.sceneState === 'added' ? 'success' : 'error'" :bordered="false">
+                  {{ scene.sceneState === 'added' ? '整场新增' : '整场删除' }}
+                </n-tag>
+              </span>
+              <span class="diff-counts">
+                <em v-if="scene.addedCount" class="added">+{{ scene.addedCount }} 新增</em>
+                <em v-if="scene.removedCount" class="removed">−{{ scene.removedCount }} 删除</em>
+                <em v-if="scene.modifiedCount" class="modified">~{{ scene.modifiedCount }} 改动</em>
+                <span class="diff-caret">{{ expandedDiffScenes.has(scene.sceneId) ? '收起 ▲' : '详情 ▼' }}</span>
+              </span>
+            </button>
+            <div v-if="expandedDiffScenes.has(scene.sceneId)" class="diff-scene-body">
+              <div v-for="cue in scene.cues" :key="cue.cueId" class="diff-cue" :class="`is-${cue.state}`">
+                <div class="diff-cue-head">
+                  <n-tag size="small" :bordered="false" :type="cue.state === 'added' ? 'success' : cue.state === 'removed' ? 'error' : 'warning'">
+                    {{ cue.state === 'added' ? '新增' : cue.state === 'removed' ? '删除' : '改动' }}
+                  </n-tag>
+                  <strong>{{ cue.title }}</strong>
+                </div>
+                <p v-if="cue.detail">{{ cue.detail }}</p>
+                <div v-for="(change, index) in cue.changes" :key="index" class="diff-change">
+                  <span class="diff-field">{{ change.label }}</span>
+                  <del class="diff-before">{{ change.before }}</del>
+                  <span class="diff-arrow">→</span>
+                  <span class="diff-after">{{ change.after }}</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+        <n-empty v-else description="当前草稿与该版本完全一致" />
+        <div class="dialog-actions">
+          <n-button @click="showDiffModal = false">关闭</n-button>
+          <n-button type="warning" tertiary @click="openRestore">恢复此版本</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showRestoreModal">
+      <div class="dialog-card">
+        <span class="eyebrow">RESTORE VERSION</span>
+        <h2>恢复「{{ selectedVersion?.name }}」</h2>
+        <template v-if="pendingChanges.length">
+          <p class="lost-title">恢复后，以下 {{ pendingChanges.length }} 条未确认修改将丢失（在记录中标记为已退回）：</p>
+          <ul class="lost-list">
+            <li v-for="change in pendingChanges" :key="change.id">
+              <strong>{{ change.label }}</strong>
+              <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+            </li>
+          </ul>
+        </template>
+        <n-alert v-else type="info" :show-icon="false">当前没有未确认修改，恢复只影响草稿内容。</n-alert>
+        <p class="restore-note">确认后草稿回到该版本内容，并生成一条新的待确认记录；撤销（⌘Z）可回到恢复前的草稿。旧版本身保持只读，不会被修改。</p>
+        <div class="dialog-actions">
+          <n-button @click="showRestoreModal = false">取消</n-button>
+          <n-button type="warning" @click="confirmRestore">确认恢复</n-button>
         </div>
       </div>
     </n-modal>
