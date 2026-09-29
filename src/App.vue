@@ -10,6 +10,7 @@ import {
   NInputNumber,
   NModal,
   NProgress,
+  NScrollbar,
   NSelect,
   NSpace,
   NTabPane,
@@ -17,7 +18,9 @@ import {
   NTag
 } from 'naive-ui'
 import { useStudio } from './useStudio'
-import type { Cue, CueKind, Rate } from './types'
+import type { Cue, CueKind, FrozenVersion, Rate } from './types'
+import { cueKindLabel, diffDocuments } from './versionDiff'
+import type { SceneDiff, VersionDiff } from './versionDiff'
 
 const studio = useStudio()
 const {
@@ -45,6 +48,7 @@ const {
   undo,
   redo,
   freeze,
+  restoreVersion,
   downloadVersion,
   resetSample
 } = studio
@@ -53,6 +57,10 @@ const dragCueId = ref('')
 const showFreezeModal = ref(false)
 const freezeName = ref('')
 const activeRightTab = ref('warnings')
+const selectedVersionId = ref('')
+const showDiffModal = ref(false)
+const showRestoreModal = ref(false)
+const diffSceneId = ref('')
 
 const kindOptions = [
   { label: '台词', value: 'dialogue' },
@@ -90,6 +98,43 @@ const projectMinutes = computed(() => `${Math.floor(totalDuration.value / 60)}:$
 const pendingCount = computed(() => pendingChanges.value.length)
 const warningCount = computed(() => warnings.value.length)
 const saveLabel = computed(() => saveState.value === 'saved' ? '已保存到本机' : '正在保存…')
+
+const selectedVersion = computed<FrozenVersion | undefined>(() => state.value.frozen.find((version) => version.id === selectedVersionId.value))
+const versionDiff = computed<VersionDiff | null>(() => {
+  if (!selectedVersion.value) return null
+  return diffDocuments(selectedVersion.value.document, state.value.document)
+})
+const diffHasChanges = computed(() => {
+  const diff = versionDiff.value
+  if (!diff) return false
+  return diff.sceneAdded > 0 || diff.sceneRemoved > 0 || diff.cueAdded > 0 || diff.cueRemoved > 0 || diff.cueModified > 0
+})
+const changedScenes = computed(() => versionDiff.value?.scenes.filter((scene) => scene.addedCues + scene.removedCues + scene.modifiedCues > 0) ?? [])
+const activeDiffScene = computed<SceneDiff | undefined>(() => versionDiff.value?.scenes.find((scene) => scene.id === diffSceneId.value) ?? changedScenes.value[0])
+const restorePendingChanges = computed(() => state.value.pending.filter((item) => item.status === 'pending'))
+
+function toggleVersion(versionId: string) {
+  selectedVersionId.value = selectedVersionId.value === versionId ? '' : versionId
+}
+
+function openDiffModal(sceneId?: string) {
+  if (!selectedVersion.value) return
+  diffSceneId.value = sceneId ?? changedScenes.value[0]?.id ?? ''
+  showDiffModal.value = true
+}
+
+function openRestoreModal() {
+  if (!selectedVersion.value) return
+  showRestoreModal.value = true
+}
+
+function confirmRestore() {
+  if (!selectedVersion.value) return
+  restoreVersion(selectedVersion.value)
+  showRestoreModal.value = false
+  showDiffModal.value = false
+  activeRightTab.value = 'pending'
+}
 
 function cueName(cue: Cue) {
   if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
@@ -384,13 +429,58 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
             <n-tab-pane name="versions" :tab="`冻结 ${state.frozen.length}`">
               <div class="review-list">
-                <div v-for="version in state.frozen" :key="version.id" class="version-card">
-                  <div>
-                    <strong>{{ version.name }}</strong>
-                    <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
-                    <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
+                <div v-for="version in state.frozen" :key="version.id" class="version-card selectable" :class="{ active: version.id === selectedVersionId }">
+                  <div class="version-head" @click="toggleVersion(version.id)">
+                    <div class="version-info">
+                      <div class="version-title-line">
+                        <strong>{{ version.name }}</strong>
+                        <n-tag size="tiny" :bordered="false">只读快照</n-tag>
+                        <n-tag v-if="version.id === selectedVersionId" size="tiny" type="info" :bordered="false">已选中</n-tag>
+                      </div>
+                      <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
+                      <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
+                    </div>
+                    <n-button size="small" type="primary" secondary @click.stop="downloadVersion(version)">导出稿</n-button>
                   </div>
-                  <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
+
+                  <template v-if="version.id === selectedVersionId && versionDiff">
+                    <div class="diff-summary">
+                      <span class="diff-summary-label">对比当前草稿</span>
+                      <n-tag size="small" type="success" :bordered="false">新增提示 {{ versionDiff.cueAdded }}</n-tag>
+                      <n-tag size="small" type="error" :bordered="false">删除提示 {{ versionDiff.cueRemoved }}</n-tag>
+                      <n-tag size="small" type="warning" :bordered="false">改动 {{ versionDiff.cueModified }}</n-tag>
+                      <n-tag v-if="versionDiff.sceneAdded" size="small" type="success" :bordered="false">新增场次 {{ versionDiff.sceneAdded }}</n-tag>
+                      <n-tag v-if="versionDiff.sceneRemoved" size="small" type="error" :bordered="false">删除场次 {{ versionDiff.sceneRemoved }}</n-tag>
+                      <span v-if="!diffHasChanges" class="diff-clean">草稿与该版本一致，没有差异</span>
+                    </div>
+
+                    <div v-if="diffHasChanges" class="scene-diff-list">
+                      <button
+                        v-for="scene in versionDiff.scenes.filter((item) => item.addedCues + item.removedCues + item.modifiedCues > 0)"
+                        :key="scene.id"
+                        class="scene-diff-row"
+                        :class="`scene-${scene.kind}`"
+                        @click="openDiffModal(scene.id)"
+                      >
+                        <strong>{{ scene.code }} · {{ scene.title }}</strong>
+                        <span class="scene-diff-counts">
+                          <em v-if="scene.kind === 'added'" class="added">整场新增</em>
+                          <em v-else-if="scene.kind === 'removed'" class="removed">整场已删除</em>
+                          <template v-else>
+                            <em v-if="scene.addedCues" class="added">+{{ scene.addedCues }}</em>
+                            <em v-if="scene.removedCues" class="removed">-{{ scene.removedCues }}</em>
+                            <em v-if="scene.modifiedCues" class="changed">改 {{ scene.modifiedCues }}</em>
+                          </template>
+                        </span>
+                        <small>查看前后内容 ›</small>
+                      </button>
+                    </div>
+
+                    <div class="version-actions">
+                      <n-button size="small" secondary :disabled="!diffHasChanges" @click="openDiffModal()">对比当前草稿</n-button>
+                      <n-button size="small" type="warning" secondary @click="openRestoreModal">恢复到此版本</n-button>
+                    </div>
+                  </template>
                 </div>
                 <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
               </div>
@@ -410,6 +500,123 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <n-button @click="showFreezeModal = false">取消</n-button>
           <n-button type="primary" @click="confirmFreeze">冻结并导出</n-button>
         </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showRestoreModal">
+      <div class="dialog-card">
+        <span class="eyebrow">RESTORE VERSION</span>
+        <h2>恢复到「{{ selectedVersion?.name }}」</h2>
+        <p>
+          草稿将整体回到该冻结版本的内容；冻结版本本身保持只读，不会被修改。
+          恢复操作本身会生成一条新的待确认记录，并且可以撤销回到恢复前的状态。
+        </p>
+        <n-alert v-if="restorePendingChanges.length" type="warning" title="以下未确认修改将会丢失">
+          <ul class="lost-changes">
+            <li v-for="change in restorePendingChanges" :key="change.id">
+              <strong>{{ change.label }}</strong>
+              <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</span>
+            </li>
+          </ul>
+        </n-alert>
+        <n-alert v-else type="info" :show-icon="false">当前没有未确认修改，可以直接恢复。</n-alert>
+        <div class="dialog-actions">
+          <n-button @click="showRestoreModal = false">取消</n-button>
+          <n-button type="warning" @click="confirmRestore">确认恢复</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showDiffModal">
+      <div class="diff-dialog">
+        <header class="diff-dialog-head">
+          <div>
+            <span class="eyebrow">VERSION DIFF</span>
+            <h2>「{{ selectedVersion?.name }}」对比当前草稿</h2>
+          </div>
+          <n-button size="small" quaternary @click="showDiffModal = false">关闭 ✕</n-button>
+        </header>
+
+        <div v-if="versionDiff" class="diff-totals">
+          <n-tag size="small" type="success" :bordered="false">新增提示 {{ versionDiff.cueAdded }}</n-tag>
+          <n-tag size="small" type="error" :bordered="false">删除提示 {{ versionDiff.cueRemoved }}</n-tag>
+          <n-tag size="small" type="warning" :bordered="false">改动 {{ versionDiff.cueModified }}</n-tag>
+          <n-tag v-if="versionDiff.sceneAdded" size="small" type="success" :bordered="false">新增场次 {{ versionDiff.sceneAdded }}</n-tag>
+          <n-tag v-if="versionDiff.sceneRemoved" size="small" type="error" :bordered="false">删除场次 {{ versionDiff.sceneRemoved }}</n-tag>
+        </div>
+
+        <div v-if="changedScenes.length > 1" class="diff-scene-tabs">
+          <button
+            v-for="scene in changedScenes"
+            :key="scene.id"
+            class="diff-scene-tab"
+            :class="{ active: scene.id === activeDiffScene?.id }"
+            @click="diffSceneId = scene.id"
+          >
+            {{ scene.code }}
+            <em v-if="scene.kind === 'added'" class="added">新增</em>
+            <em v-else-if="scene.kind === 'removed'" class="removed">删除</em>
+            <template v-else>
+              <em v-if="scene.addedCues" class="added">+{{ scene.addedCues }}</em>
+              <em v-if="scene.removedCues" class="removed">-{{ scene.removedCues }}</em>
+              <em v-if="scene.modifiedCues" class="changed">{{ scene.modifiedCues }}</em>
+            </template>
+          </button>
+        </div>
+
+        <n-scrollbar class="diff-body">
+          <section v-if="activeDiffScene" class="diff-scene">
+            <h3>
+              {{ activeDiffScene.code }} · {{ activeDiffScene.title }}
+              <n-tag v-if="activeDiffScene.kind === 'added'" size="small" type="success" :bordered="false">整场新增</n-tag>
+              <n-tag v-else-if="activeDiffScene.kind === 'removed'" size="small" type="error" :bordered="false">整场已删除</n-tag>
+            </h3>
+
+            <div v-for="cue in activeDiffScene.cues" :key="cue.id" class="cue-diff" :class="`diff-${cue.kind}`">
+              <div class="cue-diff-head">
+                <n-tag size="tiny" :type="cue.kind === 'added' ? 'success' : cue.kind === 'removed' ? 'error' : 'warning'" :bordered="false">
+                  {{ cue.kind === 'added' ? '新增' : cue.kind === 'removed' ? '删除' : '改动' }}
+                </n-tag>
+                <n-tag size="tiny" :bordered="false">{{ cueKindLabel(cue.cueKind) }}</n-tag>
+                <strong v-if="cue.kind === 'added'">#{{ cue.afterIndex + 1 }} {{ cue.afterHeadline }}</strong>
+                <strong v-else-if="cue.kind === 'removed'">#{{ cue.beforeIndex + 1 }} {{ cue.beforeHeadline }}</strong>
+                <strong v-else>
+                  #{{ cue.beforeIndex + 1 }}<span v-if="cue.moved" class="moved-mark"> → #{{ cue.afterIndex + 1 }} 顺序调整</span>
+                  <template v-else> → #{{ cue.afterIndex + 1 }}</template>
+                  {{ cue.beforeHeadline !== cue.afterHeadline ? `${cue.beforeHeadline} → ${cue.afterHeadline}` : cue.afterHeadline }}
+                </strong>
+              </div>
+
+              <template v-if="cue.kind !== 'modified'">
+                <div class="diff-pane diff-before">
+                  <span class="diff-pane-label">旧版内容</span>
+                  <p>{{ cue.beforeText || '—' }}</p>
+                </div>
+                <div class="diff-pane diff-after">
+                  <span class="diff-pane-label">当前草稿</span>
+                  <p>{{ cue.afterText || '—' }}</p>
+                </div>
+              </template>
+
+              <template v-else>
+                <div v-for="field in cue.fields" :key="field.field" class="field-diff">
+                  <span class="field-label">{{ field.label }}</span>
+                  <div class="field-values">
+                    <span class="field-before">{{ field.before }}</span>
+                    <span class="field-arrow">→</span>
+                    <span class="field-after">{{ field.after }}</span>
+                  </div>
+                </div>
+                <p v-if="!cue.fields.length" class="reorder-note">内容未变，仅在时间轴上的位置发生调整。</p>
+              </template>
+            </div>
+          </section>
+        </n-scrollbar>
+
+        <footer class="diff-dialog-foot">
+          <n-button @click="showDiffModal = false">关闭</n-button>
+          <n-button type="warning" secondary @click="showDiffModal = false; showRestoreModal = true">恢复到此版本</n-button>
+        </footer>
       </div>
     </n-modal>
   </n-config-provider>

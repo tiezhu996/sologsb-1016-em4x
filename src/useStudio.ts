@@ -29,7 +29,12 @@ export function useStudio() {
   const selectedSceneId = ref(state.value.document.scenes[0]?.id ?? '')
   const selectedCueId = ref('')
   const saveState = ref<'saved' | 'saving' | 'dirty'>('saved')
-  const undoStack = ref<StudioDocument[]>([])
+  interface UndoEntry {
+    document: StudioDocument
+    restoreChangeId?: string
+    restoredChangeIds?: string[]
+  }
+  const undoStack = ref<UndoEntry[]>([])
   const redoStack = ref<StudioDocument[]>([])
   let saveTimer: number | undefined
 
@@ -120,7 +125,7 @@ export function useStudio() {
     const before = clone(state.value.document)
     const document = clone(state.value.document)
     mutator(document)
-    undoStack.value.push(before)
+    undoStack.value.push({ document: before })
     if (undoStack.value.length > 60) undoStack.value.shift()
     redoStack.value = []
     state.value.document = document
@@ -269,7 +274,7 @@ export function useStudio() {
     const index = state.value.pending.findIndex((item) => item.id === changeId && item.status === 'pending')
     if (index < 0) return
     const change = state.value.pending[index]
-    undoStack.value.push(clone(state.value.document))
+    undoStack.value.push({ document: clone(state.value.document) })
     state.value.document = clone(change.before)
     for (let i = 0; i <= index; i += 1) {
       if (state.value.pending[i].status === 'pending') state.value.pending[i].status = 'rejected'
@@ -285,16 +290,29 @@ export function useStudio() {
   }
 
   function undo() {
-    const previous = undoStack.value.pop()
-    if (!previous) return
+    const entry = undoStack.value.pop()
+    if (!entry) return
     redoStack.value.push(clone(state.value.document))
-    replaceDocument(previous, '撤销上一步修改')
+    if (entry.restoreChangeId) {
+      // 撤销一次版本恢复：回到恢复前草稿，并退回恢复所生成的待确认记录，
+      // 恢复时被一并退回的未确认修改重新回到待确认状态。
+      const change = state.value.pending.find((item) => item.id === entry.restoreChangeId)
+      if (change && change.status === 'pending') change.status = 'rejected'
+      for (const id of entry.restoredChangeIds ?? []) {
+        const restored = state.value.pending.find((item) => item.id === id)
+        if (restored && restored.status === 'rejected') restored.status = 'pending'
+      }
+      state.value.document = clone(entry.document)
+      persist()
+    } else {
+      replaceDocument(entry.document, '撤销上一步修改')
+    }
   }
 
   function redo() {
     const next = redoStack.value.pop()
     if (!next) return
-    undoStack.value.push(clone(state.value.document))
+    undoStack.value.push({ document: clone(state.value.document) })
     replaceDocument(next, '重做修改')
   }
 
@@ -309,6 +327,31 @@ export function useStudio() {
     state.value.frozen.unshift(version)
     persist()
     return version
+  }
+
+  function restoreVersion(version: FrozenVersion) {
+    const before = clone(state.value.document)
+    // 恢复前所有未确认修改都将丢失，统一标记为已退回。
+    const restoredChangeIds = state.value.pending.filter((item) => item.status === 'pending').map((item) => item.id)
+    for (const change of state.value.pending) {
+      if (change.status === 'pending') change.status = 'rejected'
+    }
+    const restoreChangeId = uid('change')
+    undoStack.value.push({ document: before, restoreChangeId, restoredChangeIds })
+    if (undoStack.value.length > 60) undoStack.value.shift()
+    redoStack.value = []
+    state.value.document = clone(version.document)
+    state.value.pending.unshift({
+      id: restoreChangeId,
+      label: `恢复到冻结版本「${version.name}」`,
+      note: '草稿已回到该冻结版本，此记录待导演确认；撤销可回到恢复前的状态。',
+      createdAt: new Date().toISOString(),
+      status: 'pending',
+      before,
+      after: clone(version.document)
+    })
+    if (state.value.pending.length > 80) state.value.pending = state.value.pending.slice(0, 80)
+    persist()
   }
 
   function makeScript(document: StudioDocument): string {
@@ -390,6 +433,7 @@ export function useStudio() {
     undo,
     redo,
     freeze,
+    restoreVersion,
     downloadVersion,
     makeScript,
     resetSample,
